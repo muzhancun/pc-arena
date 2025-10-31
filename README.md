@@ -1,1 +1,1 @@
-# pc-arena
+# Probabilistic Circuit Arena
