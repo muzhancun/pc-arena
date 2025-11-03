@@ -20,6 +20,10 @@ All configuration files are stored under the [`configs/`](https://github.com/liu
 
 You can customize experiments by modifying the corresponding `.yaml` files or creating new ones to define your own setups.
 
+### Preparing Datasets
+
+Some datasets require preprocessing. To do so, run the corresponding file under `src/data/`.
+
 ## Example Results
 
 Below are example results obtained by running **PC-Arena** using different optimizers and probabilistic circuit architectures across several datasets.  
