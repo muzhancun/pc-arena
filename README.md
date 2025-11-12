@@ -1,6 +1,14 @@
 # Probabilistic Circuit Arena
 Probabilistic Circuit Arena is a flexible training framework for [Probabilistic Circuits](https://starai.cs.ucla.edu/papers/ProbCirc20.pdf) built on top of [PyJuice](https://github.com/Tractables/pyjuice?tab=readme-ov-file). It provides a unified and easy-to-use interface for experimenting with various learning algorithms (e.g. Full-batch EM, SGD, Mini-batch EM, Anemone) and circuit structures (e.g. HMMs, HCLTs).
 
+## Installation
+
+The framework is built on [PyJuice](https://github.com/Tractables/pyjuice?tab=readme-ov-file), PyTorch Lightning etc. To install the required dependencies, run:
+
+```bash
+pip install -r requirements.txt
+```
+
 ## Example Usage
 
 You can start training a probabilistic circuit with a single command.  

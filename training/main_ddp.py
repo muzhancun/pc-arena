@@ -23,6 +23,8 @@ from src.layers.monarchlayer import create_monarch_layers, create_dense_layer
 from src.structures.HCLTMonarch import HCLTGeneral
 sys.setrecursionlimit(15000)
 
+import wandb
+
 def ddp_setup(rank: int, world_size: int, port: int):
     if 'MASTER_ADDR' not in os.environ:
         os.environ['MASTER_ADDR'] = 'localhost'
@@ -45,9 +47,9 @@ def mkdir_p(path):
 
 def copy_configs(path, args):
     mkdir_p(path)
-    shutil.copy(os.path.join("../../configs/data/", args.data_config + ".yaml"), os.path.join(path, "data_config.yaml"))
-    shutil.copy(os.path.join("../../configs/model/", args.model_config + ".yaml"), os.path.join(path, "model_config.yaml"))
-    shutil.copy(os.path.join("../../configs/optim/", args.optim_config + ".yaml"), os.path.join(path, "optim_config.yaml"))
+    shutil.copy(os.path.join("../configs/data/", args.data_config + ".yaml"), os.path.join(path, "data_config.yaml"))
+    shutil.copy(os.path.join("../configs/model/", args.model_config + ".yaml"), os.path.join(path, "model_config.yaml"))
+    shutil.copy(os.path.join("../configs/optim/", args.optim_config + ".yaml"), os.path.join(path, "optim_config.yaml"))
 
 
 def find_largest_epoch(file_path):
@@ -89,6 +91,11 @@ def parse_arguments():
 
     parser.add_argument("--port", type = int, default = 0)
 
+    # Weights & Biases (wandb) minimal options
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging (rank 0 only)")
+    parser.add_argument("--wandb-project", type=str, default="pc-arena", help="Wandb project name")
+    parser.add_argument("--wandb-name", type=str, default=None, help="Wandb run name")
+
     args = parser.parse_args()
 
     return args
@@ -114,7 +121,7 @@ def main(rank, world_size, args):
     pcfile_best = os.path.join(base_folder, "best.jpc")
 
     # Dataset
-    data_config = OmegaConf.load(os.path.join("../../configs/data/", args.data_config + ".yaml"))
+    data_config = OmegaConf.load(os.path.join("../configs/data/", args.data_config + ".yaml"))
     if args.gpu_batch_size > 0:
         data_config["params"]["batch_size"] = args.gpu_batch_size
     dsets = instantiate_from_config(data_config)
@@ -129,7 +136,7 @@ def main(rank, world_size, args):
             epoch_start = find_largest_epoch(logfile) + 1
             print(f"[rank {rank}] PC loaded...")
         else:
-            model_config = OmegaConf.load(os.path.join("../../configs/model/", args.model_config + ".yaml"))
+            model_config = OmegaConf.load(os.path.join("../configs/model/", args.model_config + ".yaml"))
             model_kwargs = {}
             for k, v in model_config["params"].items():
                 if isinstance(v, str) and v.startswith("__train_data__:"):
@@ -179,7 +186,7 @@ def main(rank, world_size, args):
     print(f"[rank {rank}] Dataloaders constructed")
 
     # Optimizer
-    optim_config = OmegaConf.load(os.path.join("../../configs/optim/", args.optim_config + ".yaml"))
+    optim_config = OmegaConf.load(os.path.join("../configs/optim/", args.optim_config + ".yaml"))
     optim_mode = optim_config["mode"]
     num_epochs = optim_config["num_epochs"]
     if optim_mode == "full_em":
@@ -217,6 +224,31 @@ def main(rank, world_size, args):
     else:
         lr_scheduler = None
 
+    # Initialize Weights & Biases on rank 0 if requested (minimal)
+    use_wandb = (rank == 0) and bool(getattr(args, "wandb", False))
+    wandb_run = None
+    if use_wandb:
+        if wandb is None:
+            print("[rank 0] wandb is not installed; proceeding without logging.")
+            use_wandb = False
+        else:
+            run_name = args.wandb_name or f"{args.data_config}-{args.model_config}-{args.optim_config}-{time.strftime('%Y%m%d_%H%M%S')}"
+            try:
+                wandb_run = wandb.init(project=args.wandb_project, name=run_name, config={
+                    "data_config": args.data_config,
+                    "model_config": args.model_config,
+                    "optim_config": args.optim_config,
+                    "gpu_batch_size": args.gpu_batch_size,
+                    "layer_type": args.layer_type,
+                    "world_size": world_size,
+                    "optim_mode": optim_mode,
+                    "niters_per_update": niters_per_update,
+                })
+                print(f"[rank 0] wandb initialized: project={args.wandb_project}, name={run_name}")
+            except Exception as e:
+                print(f"[rank 0] Failed to initialize wandb: {e}. Proceeding without wandb.")
+                use_wandb = False
+
     dist.barrier()
 
     # Sanity check
@@ -252,6 +284,7 @@ def main(rank, world_size, args):
 
     step_count = 0
     global_step_count = 0
+    wandb_step = 0
 
     for epoch in range(epoch_start, num_epochs + 1):
         train_sampler.set_epoch(epoch)
@@ -279,6 +312,15 @@ def main(rank, world_size, args):
                 curr_ll = stats[0].item() / world_size
 
                 progress_bar.new_batch_done([curr_ll])
+                # per-batch logging
+                if use_wandb:
+                    wandb.log({
+                        "train/ll": curr_ll,
+                        "trainer/epoch": epoch,
+                        "trainer/step_in_epoch": step_count,
+                        "trainer/global_step": wandb_step,
+                    }, step=wandb_step)
+                    wandb_step += 1
 
             step_count += 1
             if step_count >= niters_per_update:
@@ -320,11 +362,22 @@ def main(rank, world_size, args):
                 pc.init_param_flows(flows_memory = 0.0)
 
                 global_step_count += 1
+                if rank == 0 and use_wandb:
+                    wandb.log({
+                        "optim/step_size": float(step_size),
+                        "trainer/global_update": global_step_count,
+                    }, step=wandb_step)
 
         if rank == 0:
             aveg_train_ll = progress_bar.epoch_ends()[0]
             with open(logfile, "a+") as f:
                 f.write(f"[Epoch {epoch:05d}] - Aveg train LL: {aveg_train_ll:.4f}; Step size: {step_size:.4f}\n")
+            if use_wandb:
+                wandb.log({
+                    "train/ll_epoch": aveg_train_ll,
+                    "optim/step_size": float(step_size),
+                    "trainer/epoch": epoch,
+                }, step=wandb_step)
 
         if epoch % 5 == 0:
             local_ll_sum = 0.0
@@ -350,6 +403,12 @@ def main(rank, world_size, args):
                 with open(logfile, "a+") as f:
                     f.write(f"[Epoch {epoch:05d}] - Aveg validation LL: {aveg_valid_ll:.4f}\n")
 
+                if use_wandb:
+                    wandb.log({
+                        "valid/ll": aveg_valid_ll,
+                        "trainer/epoch": epoch,
+                    }, step=wandb_step)
+
                 juice.save(pcfile_last, pc)
 
                 if aveg_valid_ll > best_val_ll:
@@ -359,6 +418,13 @@ def main(rank, world_size, args):
                 print("> PC saved.")
 
             dist.barrier()
+
+    # Finish wandb run gracefully
+    if rank == 0 and use_wandb and wandb is not None:
+        try:
+            wandb.finish()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
